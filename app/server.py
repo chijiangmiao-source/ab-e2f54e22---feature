@@ -6,6 +6,8 @@
   GET  /health               健康检查
   POST /api/solve            提交网络求解（支持 X-Audit-Id 幂等）
   GET  /api/records/<id>     查看审计原记录
+  POST /api/embed            对已冻结 optimal 审计做不可拆分批次完整嵌入核验
+  GET  /api/groups/<id>      查看编组核验原记录
 """
 
 from __future__ import annotations
@@ -17,12 +19,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from audit import AuditError, AuditStore
+from embed import embed_payload
+from groups import GroupConflict, GroupStore
 from solver import ValidationError, solve_payload
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUDIT_DB = os.environ.get("AUDIT_DB", "/data/audit.json")
+GROUP_DB = os.environ.get("GROUP_DB", "/data/groups.json")
 
 _store = AuditStore(AUDIT_DB)
+_group_store = GroupStore(GROUP_DB)
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
@@ -95,12 +101,23 @@ class Handler(BaseHTTPRequestHandler):
                                 404)
             else:
                 self._send_json(rec)
+        elif path.startswith("/api/groups/"):
+            group_id = unquote(path[len("/api/groups/"):])
+            rec = _group_store.get(group_id)
+            if rec is None:
+                self._send_json({"error": "编组标识不存在", "group_id": group_id},
+                                404)
+            else:
+                self._send_json(rec)
         else:
             self._send_json({"error": "not found", "path": path}, 404)
 
     # ------------------------------------------------------------ POST
     def do_POST(self):
         path = urlsplit(self.path).path
+        if path == "/api/embed":
+            self._handle_embed()
+            return
         if path != "/api/solve":
             self._send_json({"error": "not found", "path": path}, 404)
             return
@@ -161,6 +178,93 @@ class Handler(BaseHTTPRequestHandler):
             }, http_status)
         else:
             self._send_json(body, http_status)
+
+    # ------------------------------------------------- 不可拆分批次嵌入核验
+    def _handle_embed(self):
+        payload = self._read_json()
+        if payload is _MISSING:
+            return
+        if not isinstance(payload, dict):
+            self._send_json(
+                {"error": "请求体必须是 JSON 对象 {audit_id, group_id, batches}"},
+                400)
+            return
+
+        audit_id = self.headers.get("X-Audit-Id") or payload.get("audit_id")
+        group_id = self.headers.get("X-Group-Id") or payload.get("group_id")
+        if not isinstance(audit_id, str) or not _SAFE_NAME.match(audit_id) \
+                or len(audit_id) > 64:
+            self._send_json(
+                {"error": "必须提供来源审计标识 audit_id（<=64 字符的"
+                          "字母/数字/._- 组合），服务只接受已冻结 optimal 来源"},
+                400)
+            return
+        if not isinstance(group_id, str) or not _SAFE_NAME.match(group_id) \
+                or len(group_id) > 64:
+            self._send_json(
+                {"error": "必须提供稳定编组标识 group_id（<=64 字符的"
+                          "字母/数字/._- 组合）"}, 400)
+            return
+
+        # 用于幂等指纹的规范编组载荷：仅来源标识 + 批次定义（剔除控制字段）
+        # 统一以解析出的来源标识为准，避免头与 JSON 字段不一致造成歧义。
+        fp_payload = {"audit_id": audit_id,
+                      "batches": payload.get("batches")}
+
+        # 同编组标识重传：命中原记录（同来源同批次）回放，改换来源/批次 409
+        try:
+            hit = _group_store.lookup(group_id, audit_id, fp_payload)
+        except GroupConflict as exc:
+            self._send_json(
+                {"error": exc.message, "conflict": exc.existing}, 409)
+            return
+        if hit is not None:
+            self._send_json({
+                "group_id": group_id,
+                "audit_id": hit.get("audit_id"),
+                "replayed": True,
+                "status": hit["status"],
+                "payload_fingerprint": hit["payload_fingerprint"],
+                "result": hit["result"],
+            }, 200, [("X-Idempotent-Replay", "true")])
+            return
+
+        # 来源必须是已冻结的 optimal 审计原记录
+        rec = _store.get(audit_id)
+        if rec is None:
+            self._send_json({
+                "error": f"来源审计 {audit_id!r} 不存在；请先以该标识完成一次 "
+                         "optimal 求解并冻结",
+                "audit_id": audit_id}, 404)
+            return
+        if rec.get("status") != "optimal":
+            self._send_json({
+                "error": "服务只接受 optimal 来源；来源审计当前状态为 "
+                         f"{rec.get('status')!r}，拒绝冻结嵌入",
+                "audit_id": audit_id, "source_status": rec.get("status")}, 409)
+            return
+
+        try:
+            result = embed_payload(rec["result"], audit_id, payload)
+        except ValidationError as exc:
+            self._send_json(
+                {"error": exc.message, "loc": exc.loc, "status": "invalid"},
+                400)
+            return
+        except Exception as exc:  # 防御性：不吞掉状态
+            self._send_json({"error": f"服务器内部错误: {exc!r}"}, 500)
+            return
+
+        status = result["status"]  # embedded | cannot_embed（均落盘原结论）
+        saved = _group_store.save(group_id, audit_id, fp_payload, status, result)
+        self._send_json({
+            "group_id": group_id,
+            "audit_id": audit_id,
+            "replayed": False,
+            "status": status,
+            "payload_fingerprint": saved["payload_fingerprint"],
+            "result": result,
+        }, 200)
 
 
 _MISSING = object()

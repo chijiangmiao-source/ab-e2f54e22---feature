@@ -308,3 +308,345 @@ document.querySelector("#loadSample").onclick = () => {
 for (const s of SAMPLE.stations) addStationRow(s.id, String(s.balance));
 for (const p of SAMPLE.pipes) addPipeRow(p);
 renderCounter();
+
+// ============================================================
+// 冻结嵌入核验：不可拆分批次 · 完整简单路径整数分配
+// ============================================================
+const MAX_BATCHES = 6;
+const batchBody = document.querySelector("#batchTable tbody");
+const batchCounter = document.querySelector("#batchCounter");
+const embedPreview = document.querySelector("#embedPreview");
+const embedStatusBanner = document.querySelector("#embedStatusBanner");
+const embedBody = document.querySelector("#embedBody");
+const embedAuditInput = document.querySelector("#embedAuditId");
+const groupInput = document.querySelector("#groupId");
+const FORM_KEY = "embedFormV1";
+
+function renderBatchCounter() {
+  batchCounter.textContent = `批次 ${batchBody.rows.length}/${MAX_BATCHES}`;
+}
+
+function addBatchRow(b = {}) {
+  if (batchBody.rows.length >= MAX_BATCHES) return;
+  const tr = el("tr");
+  const idIn = el("input", { type: "text", maxlength: "32", value: b.id || "" });
+  const fromSel = el("select");
+  const toSel = el("select");
+  const volIn = el("input", { type: "text", inputmode: "integer",
+                              value: b.volume ?? "" });
+  const avoidIn = el("input", { type: "text",
+    value: b.avoid || b.avoidStr || "",
+    placeholder: "如 p2,p5" });
+  avoidIn.style.width = "200px";
+  const refresh = () => {
+    for (const [sel, cur] of [[fromSel, b.from], [toSel, b.to]]) {
+      const old = sel.value || cur;
+      sel.innerHTML = "";
+      sel.appendChild(el("option", { value: "", text: "选择…" }));
+      for (const sid of stationIds())
+        sel.appendChild(el("option", { value: sid, text: sid }));
+      if (old && stationIds().includes(old)) sel.value = old;
+    }
+  };
+  stationBody.addEventListener("change", refresh);
+  stationBody.addEventListener("input", refresh);
+  tr.appendChild(el("td", {}, idIn));
+  tr.appendChild(el("td", {}, fromSel));
+  tr.appendChild(el("td", {}, toSel));
+  tr.appendChild(el("td", {}, volIn));
+  tr.appendChild(el("td", {}, avoidIn));
+  tr.appendChild(el("td", {}, el("button", {
+    type: "button", text: "删除",
+    onclick: () => { tr.remove(); renderBatchCounter(); saveEmbedForm(); },
+  })));
+  batchBody.appendChild(tr);
+  refresh();
+  renderBatchCounter();
+}
+
+function collectForm() {
+  const auditId = embedAuditInput.value.trim();
+  const groupId = groupInput.value.trim();
+  const batches = [];
+  const bids = new Set();
+  [...batchBody.rows].forEach((row, i) => {
+    const inputs = row.querySelectorAll("input");
+    const selects = row.querySelectorAll("select");
+    const bid = inputs[0].value.trim();
+    if (!bid) throw { loc: `batches[${i}].id`, message: "批次标识不能为空" };
+    if (bids.has(bid)) throw { loc: `batches[${i}].id`,
+                               message: `批次标识重复: ${bid}` };
+    bids.add(bid);
+    if (!selects[0].value) throw { loc: `batches[${i}].from`, message: "请选择来源站" };
+    if (!selects[1].value) throw { loc: `batches[${i}].to`, message: "请选择目标站" };
+    if (selects[0].value === selects[1].value)
+      throw { loc: `batches[${i}]`, message: "来源站目标站不能相同" };
+    const volume = safeInt(inputs[1].value, `batches[${i}].volume`);
+    if (volume <= 0) throw { loc: `batches[${i}].volume`,
+                             message: "体积必须为正整数" };
+    const avoid = inputs[2].value.split(",").map(s => s.trim())
+      .filter(Boolean);
+    batches.push({ id: bid, from: selects[0].value, to: selects[1].value,
+                   volume, avoid });
+  });
+  if (!batches.length) throw { loc: "batches", message: "至少添加一批" };
+  return { auditId, groupId, batches };
+}
+
+function saveEmbedForm() {
+  try {
+    const prev = JSON.parse(localStorage.getItem(FORM_KEY) || "{}");
+    // 仅当编组标识未变时保留“已确认”标记，便于刷新后重新核对
+    const keepConfirmed = prev.groupId === groupInput.value.trim()
+      ? prev.confirmedGroupId : undefined;
+    const form = {
+      auditId: embedAuditInput.value.trim(),
+      groupId: groupInput.value.trim(),
+      confirmedGroupId: keepConfirmed,
+      batches: [...batchBody.rows].map(row => {
+        const inputs = row.querySelectorAll("input");
+        const selects = row.querySelectorAll("select");
+        return { id: inputs[0].value, from: selects[0].value,
+                 to: selects[1].value, volume: inputs[1].value,
+                 avoid: inputs[2].value };
+      }),
+    };
+    localStorage.setItem(FORM_KEY, JSON.stringify(form));
+  } catch (e) { /* 存储不可用时静默 */ }
+}
+
+// ------------------------------------------------------------ 结果渲染
+function renderEmbedded(r) {
+  embedBody.appendChild(el("div", { class: "kv" },
+    el("div", { class: "box" },
+      el("div", { class: "label", text: "完整搜索节点数（穷尽回溯）" }),
+      el("div", { class: "value", text: r.search?.nodes ?? "-" })),
+    el("div", { class: "box" },
+      el("div", { class: "label", text: "来源冻结审计" }),
+      el("div", { class: "value mono", style: "font-size:15px",
+                  text: r.frozen_audit_id }))));
+
+  const brows = r.batches.map(b => el("tr", {},
+    el("td", { class: "mono", text: b.id }),
+    el("td", { text: `${b.from} → ${b.to}` }),
+    el("td", { class: "mono", text: b.volume }),
+    el("td", { class: "mono", text: (b.avoid || []).join(", ") || "—" }),
+    el("td", { class: "mono", text: b.path.stations.join(" → ") }),
+    el("td", { class: "mono", text: b.path.pipes.join(" → ") })));
+  embedBody.appendChild(el("h3", { text: "按批次规范路径（不可拆分）" }));
+  embedBody.appendChild(el("div", { class: "table-wrap" },
+    el("table", { class: "result" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "批次" }), el("th", { text: "方向" }),
+        el("th", { text: "体积" }), el("th", { text: "禁经" }),
+        el("th", { text: "站点路径" }), el("th", { text: "管路路径" }))),
+      el("tbody", {}, ...brows))));
+
+  const prows = r.pipe_usage.map(p => el("tr", {},
+    el("td", { class: "mono", text: p.pipe }),
+    el("td", { text: `${p.from} → ${p.to}` }),
+    el("td", { class: "mono", text: p.frozen_flow }),
+    el("td", { class: "mono", text: p.used }),
+    el("td", { class: p.remaining === 0 ? "bad mono" : "ok mono",
+               text: p.remaining }),
+    el("td", { class: "mono",
+      text: p.by.map(x => `${x.batch}:${x.amount}`).join(", ") || "—" })));
+  embedBody.appendChild(el("h3", { text: "逐管占用与剩余通量" }));
+  embedBody.appendChild(el("div", { class: "table-wrap" },
+    el("table", { class: "result" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "管路" }), el("th", { text: "方向" }),
+        el("th", { text: "冻结流量" }), el("th", { text: "批次占用合计" }),
+        el("th", { text: "剩余通量" }), el("th", { text: "占用明细" }))),
+      el("tbody", {}, ...prows))));
+}
+
+function renderCannotEmbed(r) {
+  embedBody.appendChild(el("p", { class: "hint" }, el("span", { text: r.note })));
+  embedBody.appendChild(el("p", {},
+    el("b", { text: "最先耗尽搜索层：" }),
+    el("span", { class: "mono", text: String(r.critical_layer) })));
+
+  const urows = (r.unplaced_batches || []).map(u => el("tr", {},
+    el("td", { class: "mono", text: u.id }),
+    el("td", { class: "mono", text: u.search_layer }),
+    el("td", { class: "mono", text: u.candidate_simple_paths }),
+    el("td", { class: "mono bad", text: u.paths_still_fitting_snapshot })));
+  embedBody.appendChild(el("h3", { text: "未安置批次（自最深耗尽层起）" }));
+  embedBody.appendChild(el("div", { class: "table-wrap" },
+    el("table", { class: "result" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "批次" }), el("th", { text: "搜索层" }),
+        el("th", { text: "候选简单路径数" }),
+        el("th", { text: "快照下仍可容纳的路径数" }))),
+      el("tbody", {}, ...urows))));
+
+  const srows = (r.saturated_pipes || []).map(p => el("tr", {},
+    el("td", { class: "mono", text: p.pipe }),
+    el("td", { text: `${p.from} → ${p.to}` }),
+    el("td", { class: "mono", text: p.frozen_flow }),
+    el("td", { class: "mono bad", text: p.used }),
+    el("td", { class: "mono bad", text: "0" })));
+  embedBody.appendChild(el("h3", {
+    text: (r.saturated_pipes || []).length
+      ? "已占满管路（占用 = 冻结流量）" : "已占满管路（无）" }));
+  if (srows.length) embedBody.appendChild(el("div", { class: "table-wrap" },
+    el("table", { class: "result" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "管路" }), el("th", { text: "方向" }),
+        el("th", { text: "冻结流量" }), el("th", { text: "占用" }),
+        el("th", { text: "剩余" }))),
+      el("tbody", {}, ...srows))));
+
+  const prows = (r.pipe_usage || []).map(p => el("tr", {},
+    el("td", { class: "mono", text: p.pipe }),
+    el("td", { text: `${p.from} → ${p.to}` }),
+    el("td", { class: "mono", text: p.frozen_flow }),
+    el("td", { class: "mono", text: p.used }),
+    el("td", { class: p.remaining === 0 ? "bad mono" : "mono",
+               text: p.remaining })));
+  embedBody.appendChild(el("details", { open: "" },
+    el("summary", { text: "各管剩余容量（耗尽快照）" }),
+    el("div", { class: "table-wrap" },
+      el("table", { class: "result" },
+        el("thead", {}, el("tr", {},
+          el("th", { text: "管路" }), el("th", { text: "方向" }),
+          el("th", { text: "冻结流量" }), el("th", { text: "占用" }),
+          el("th", { text: "剩余容量" }))),
+        el("tbody", {}, ...prows)))));
+}
+
+function showEmbed(kind, r, envelope) {
+  embedBody.innerHTML = "";
+  embedStatusBanner.innerHTML = "";
+  if (kind === "embedded") {
+    embedStatusBanner.appendChild(el("div",
+      { class: "banner optimal",
+        text: `✓ 全部批次可同时嵌入冻结流量`
+          + (envelope?.replayed ? "（编组原结论重放）" : "") }));
+    renderEmbedded(r);
+  } else if (kind === "cannot_embed") {
+    embedStatusBanner.appendChild(el("div",
+      { class: "banner infeasible",
+        text: "✗ 无法同时嵌入（完整穷尽分配后的稳定结论"
+          + (envelope?.replayed ? "· 原结论重放" : "") + "）" }));
+    renderCannotEmbed(r);
+  } else {
+    embedStatusBanner.appendChild(el("div", { class: "banner invalid",
+      text: "⚠ 核验请求被拒绝" }));
+    embedBody.appendChild(el("p", {},
+      el("b", { class: "bad", text: "原因：" }),
+      el("span", { class: "mono",
+        text: ` ${r.loc ? r.loc + " — " : ""}${r.error}` })));
+  }
+}
+
+async function submitEmbed() {
+  let form;
+  try {
+    form = collectForm();
+  } catch (e) {
+    showEmbed("invalid", { error: e.message, loc: e.loc });
+    return;
+  }
+  if (!form.auditId) {
+    showEmbed("invalid", { error: "请填写已冻结 optimal 的来源审计标识",
+                           loc: "audit_id" });
+    return;
+  }
+  if (!form.groupId) {
+    showEmbed("invalid", { error: "请填写稳定编组标识", loc: "group_id" });
+    return;
+  }
+  const body = { audit_id: form.auditId, group_id: form.groupId,
+                 batches: form.batches };
+  embedPreview.textContent = JSON.stringify(body, null, 2);
+  saveEmbedForm();
+  try {
+    const resp = await fetch("/api/embed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 "X-Audit-Id": form.auditId, "X-Group-Id": form.groupId },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (resp.status === 400 || resp.status === 404 || resp.status === 409) {
+      showEmbed("invalid", { error: data.error, loc: data.loc });
+      return;
+    }
+    // 200（embedded / cannot_embed 均已落盘）：标记为可在刷新后核对的编组
+    try {
+      const f = JSON.parse(localStorage.getItem(FORM_KEY) || "{}");
+      f.confirmedGroupId = form.groupId;
+      localStorage.setItem(FORM_KEY, JSON.stringify(f));
+    } catch (e) { /* ignore */ }
+    showEmbed(data.result.status, data.result, data);
+  } catch (e) {
+    showEmbed("invalid", { error: `请求失败: ${e}`, loc: "$" });
+  }
+}
+
+async function lookupGroup() {
+  const groupId = groupInput.value.trim();
+  if (!groupId) {
+    showEmbed("invalid", { error: "请填写要查询的稳定编组标识", loc: "group_id" });
+    return;
+  }
+  saveEmbedForm();
+  try {
+    const resp = await fetch(`/api/groups/${encodeURIComponent(groupId)}`);
+    const data = await resp.json();
+    if (resp.status !== 200) {
+      showEmbed("invalid", { error: data.error || "编组不存在", loc: "group_id" });
+      return;
+    }
+    if (embedAuditInput.value.trim() === "")
+      embedAuditInput.value = data.audit_id || "";
+    showEmbed(data.result.status, data.result,
+              { replayed: true });
+  } catch (e) {
+    showEmbed("invalid", { error: `请求失败: ${e}`, loc: "$" });
+  }
+}
+
+document.querySelector("#addBatch").onclick = () => { addBatchRow(); saveEmbedForm(); };
+document.querySelector("#embedSubmitBtn").onclick = submitEmbed;
+document.querySelector("#groupLookupBtn").onclick = lookupGroup;
+for (const node of [embedAuditInput, groupInput])
+  node.addEventListener("change", saveEmbedForm);
+// 批次行内的任何编辑也即时留存，刷新/重开后表单与结论一致
+batchBody.addEventListener("input", saveEmbedForm);
+batchBody.addEventListener("change", saveEmbedForm);
+
+const EMBED_SAMPLE = [
+  { id: "B1", from: "S1", to: "D2", volume: 2, avoid: "p5" },
+  { id: "B2", from: "S2", to: "D1", volume: 1, avoid: "" },
+];
+document.querySelector("#embedSampleBtn").onclick = () => {
+  batchBody.innerHTML = "";
+  for (const b of EMBED_SAMPLE) addBatchRow(b);
+  if (!embedAuditInput.value.trim()) embedAuditInput.value = "run-embed-base";
+  if (!groupInput.value.trim()) groupInput.value = "group-sample-1";
+  renderBatchCounter();
+  saveEmbedForm();
+};
+
+// 刷新 / 重新打开：恢复表单并从服务端核对同一编组结论
+(function restoreEmbedForm() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(FORM_KEY) || "null"); }
+  catch (e) { saved = null; }
+  if (saved && Array.isArray(saved.batches) && saved.batches.length) {
+    embedAuditInput.value = saved.auditId || "";
+    groupInput.value = saved.groupId || "";
+    batchBody.innerHTML = "";
+    for (const b of saved.batches) addBatchRow(b);
+    renderBatchCounter();
+    // 仅在该编组确曾被服务端接受落盘时，刷新/重开后自动核对同一结论
+    if (saved.groupId && saved.confirmedGroupId === saved.groupId)
+      lookupGroup();
+  } else {
+    for (const b of EMBED_SAMPLE) addBatchRow(b);
+    renderBatchCounter();
+  }
+})();

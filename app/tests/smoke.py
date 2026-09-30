@@ -104,6 +104,87 @@ s, b5 = call("POST", "/api/solve", bad_input)
 check("非法输入定位字段", s == 400 and b5.get("loc") == "stations[0].balance",
       str(b5))
 
+# ------------------------------------------------------------ 冻结嵌入核验
+DIAMOND = {
+    "stations": [{"id": "S", "balance": 4}, {"id": "C", "balance": 0},
+                 {"id": "D", "balance": 0}, {"id": "T", "balance": -4}],
+    "pipes": [
+        {"id": "eSC", "from": "S", "to": "C", "lo": 2, "hi": 2, "cost": 0},
+        {"id": "eCT", "from": "C", "to": "T", "lo": 2, "hi": 2, "cost": 0},
+        {"id": "eSD", "from": "S", "to": "D", "lo": 2, "hi": 2, "cost": 0},
+        {"id": "eDT", "from": "D", "to": "T", "lo": 2, "hi": 2, "cost": 0}],
+}
+s, b6 = call("POST", "/api/solve", DIAMOND, {"X-Audit-Id": "smoke-diamond"})
+check("冻结来源 optimal", s == 200 and b6.get("status") == "optimal", str(s))
+
+def embed(group, batches, audit="smoke-diamond"):
+    return call("POST", "/api/embed",
+                {"audit_id": audit, "group_id": group, "batches": batches},
+                {"X-Audit-Id": audit, "X-Group-Id": group})
+
+# 可装入：完整搜索让 X 走 S-D-T、Y 走 eCT（朴素贪心会误判失败）
+s, g1 = embed("smoke-group-ok", [
+    {"id": "X", "from": "S", "to": "T", "volume": 2},
+    {"id": "Y", "from": "C", "to": "T", "volume": 1}])
+rg = g1.get("result", {})
+ok_paths = {x["id"]: x["path"]["pipes"] for x in rg.get("batches", [])}
+cap_ok = all(p["used"] <= p["frozen_flow"] and
+             p["remaining"] == p["frozen_flow"] - p["used"]
+             for p in rg.get("pipe_usage", []))
+check("可装入：完整分配给出规范路径且不超冻结流量",
+      s == 200 and rg.get("status") == "embedded" and
+      ok_paths.get("Y") == ["eCT"] and ok_paths.get("X") == ["eSD", "eDT"] and
+      cap_ok, str(g1)[:300])
+
+# 管路竞争失败：两批 C->T 争 eCT（冻结 2），总量 3 > 2
+s, g2 = embed("smoke-group-bad", [
+    {"id": "P", "from": "C", "to": "T", "volume": 2},
+    {"id": "Q", "from": "C", "to": "T", "volume": 1}])
+rg2 = g2.get("result", {})
+check("管路竞争失败：列未安置批次/占满管路/剩余容量",
+      s == 200 and rg2.get("status") == "cannot_embed" and
+      "Q" in rg2.get("unplaced_batch_ids", []) and
+      "eCT" in [x["pipe"] for x in rg2.get("saturated_pipes", [])] and
+      any(p["pipe"] == "eCT" and p["remaining"] == 0
+          for p in rg2.get("pipe_usage", [])), str(g2)[:300])
+
+# 同编组同定义重放原结论
+s, g3 = embed("smoke-group-ok", [
+    {"id": "X", "from": "S", "to": "T", "volume": 2},
+    {"id": "Y", "from": "C", "to": "T", "volume": 1}])
+check("同编组同定义重放原结论",
+      s == 200 and g3.get("replayed") is True and
+      g3.get("result") == rg, str(s))
+
+# 同编组改批次 / 换来源 -> 409
+s, g4 = embed("smoke-group-ok", [
+    {"id": "X", "from": "S", "to": "T", "volume": 1}])
+check("同编组改批次拒绝 409", s == 409, str(s))
+s, g5 = embed("smoke-group-ok",
+              [{"id": "X", "from": "S", "to": "T", "volume": 2},
+               {"id": "Y", "from": "C", "to": "T", "volume": 1}],
+              audit="smoke-run-1")
+check("同编组换来源拒绝 409", s == 409 and
+      g5.get("conflict", {}).get("audit_id") == "smoke-diamond", str(s))
+
+# 读取接口可取回同一编组结论
+s, g6 = call("GET", "/api/groups/smoke-group-bad")
+check("GET /api/groups/<id> 取回原结论",
+      s == 200 and g6.get("result", {}).get("status") == "cannot_embed",
+      str(s))
+
+# 非 optimal 来源拒绝冻结：先制造一个 infeasible 审计作为来源
+call("POST", "/api/solve",
+     {"stations": [{"id": "S", "balance": 5}, {"id": "T", "balance": -5}],
+      "pipes": [{"id": "x", "from": "S", "to": "T", "lo": 0, "hi": 2,
+                 "cost": 1}]},
+     {"X-Audit-Id": "smoke-infeasible-1"})
+s, g7 = embed("smoke-group-src",
+              [{"id": "P", "from": "S", "to": "T", "volume": 1}],
+              audit="smoke-infeasible-1")
+check("非 optimal 来源拒绝(409)", s == 409 and "optimal" in g7.get("error", ""),
+      str(s))
+
 failed = [n for n, ok, _ in CHECKS if not ok]
 print(f"[smoke] {len(CHECKS) - len(failed)}/{len(CHECKS)} passed")
 sys.exit(1 if failed else 0)

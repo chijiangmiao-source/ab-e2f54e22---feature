@@ -65,6 +65,41 @@
     <div id="statusBanner"></div>
     <div id="resultBody"></div>
   </section>
+
+  <section class="card" id="embedCard">
+    <h2>6. 冻结嵌入核验（不可拆分标准样品批次）</h2>
+    <p class="hint">
+      先在上方用<b>审计标识</b>完成一次 <b>optimal</b> 求解以冻结站点、稳定管路顺序与各管流量；
+      再提交至多 <b>6 批</b>不可拆分样品。每批整批走同一条简单路径（避开指定管路），
+      后端在各批<b>全部简单路径</b>之间做<b>完整整数容量分配</b>（穷尽回溯＋记忆，非最短路/贪心/有限尝试）。
+      任一管路批次总量超过冻结流量即判定不可同时嵌入。
+    </p>
+    <div class="row">
+      <label class="hint">来源审计标识</label>
+      <input id="embedAuditId" type="text" maxlength="64" placeholder="已冻结 optimal 的 audit id">
+      <label class="hint">稳定编组标识</label>
+      <input id="groupId" type="text" maxlength="64" placeholder="例如 group-A（字母/数字/._-）">
+    </div>
+    <div class="table-wrap">
+      <table id="batchTable">
+        <thead><tr>
+          <th>批次标识</th><th>来源站 from</th><th>目标站 to</th>
+          <th>整数体积</th><th>禁经管路（逗号分隔 id，可空）</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row">
+      <button type="button" id="addBatch">＋ 增加批次</button>
+      <button type="button" id="embedSubmitBtn" class="primary">完整核验能否嵌入</button>
+      <button type="button" id="groupLookupBtn">按编组标识查询原结论</button>
+      <button type="button" id="embedSampleBtn">载入嵌入示例</button>
+      <span id="batchCounter" class="hint"></span>
+    </div>
+    <pre id="embedPreview" class="preview"></pre>
+    <div id="embedStatusBanner"></div>
+    <div id="embedBody"></div>
+  </section>
 </main>
 
 <footer>后端：下界消去 → Dinic 可行流 → Bellman-Ford 负环消除（精确整数，不限轮次）</footer>
