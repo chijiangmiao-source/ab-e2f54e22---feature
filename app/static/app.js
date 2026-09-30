@@ -2,6 +2,7 @@
 
 const MAX_STATIONS = 12;
 const MAX_PIPES = 36;
+const MAX_BATCHES = 6;
 
 const stationBody = document.querySelector("#stationTable tbody");
 const pipeBody = document.querySelector("#pipeTable tbody");
@@ -10,6 +11,11 @@ const requestPreview = document.querySelector("#requestPreview");
 const resultCard = document.querySelector("#resultCard");
 const statusBanner = document.querySelector("#statusBanner");
 const resultBody = document.querySelector("#resultBody");
+const batchBody = document.querySelector("#batchTable tbody");
+const batchCounter = document.querySelector("#batchCounter");
+const embedResultCard = document.querySelector("#embedResultCard");
+const embedBanner = document.querySelector("#embedBanner");
+const embedBody = document.querySelector("#embedBody");
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -83,6 +89,49 @@ function addPipeRow(p = {}) {
 function renderCounter() {
   counter.textContent =
     `站点 ${stationBody.rows.length}/${MAX_STATIONS} · 管路 ${pipeBody.rows.length}/${MAX_PIPES}`;
+}
+
+// ------------------------------------------------------------ 编组批次行
+function addBatchRow(b = {}) {
+  if (batchBody.rows.length >= MAX_BATCHES) return;
+  const tr = el("tr");
+  const idIn = el("input", { type: "text", maxlength: "32", value: b.id || "" });
+  const srcSel = el("select");
+  const dstSel = el("select");
+  const volIn = el("input", { type: "text", inputmode: "integer",
+                              value: b.volume ?? "" });
+  const forbidIn = el("input", {
+    type: "text", value: (b.forbid || []).join(","),
+    placeholder: "如 p5,p7", style: "width:150px",
+  });
+  const refresh = () => {
+    const ids = stationIds();
+    for (const [sel, cur] of [[srcSel, b.source], [dstSel, b.target]]) {
+      const old = sel.value || cur;
+      sel.innerHTML = "";
+      sel.appendChild(el("option", { value: "", text: "选择…" }));
+      for (const sid of ids) sel.appendChild(el("option", { value: sid, text: sid }));
+      if (old && ids.includes(old)) sel.value = old;
+    }
+  };
+  stationBody.addEventListener("change", refresh);
+  stationBody.addEventListener("input", refresh);
+  tr.appendChild(el("td", {}, idIn));
+  tr.appendChild(el("td", {}, srcSel));
+  tr.appendChild(el("td", {}, dstSel));
+  tr.appendChild(el("td", {}, volIn));
+  tr.appendChild(el("td", {}, forbidIn));
+  tr.appendChild(el("td", {}, el("button", {
+    type: "button", text: "删除",
+    onclick: () => { tr.remove(); renderBatchCounter(); },
+  })));
+  batchBody.appendChild(tr);
+  refresh();
+  renderBatchCounter();
+}
+
+function renderBatchCounter() {
+  batchCounter.textContent = `批次 ${batchBody.rows.length}/${MAX_BATCHES}`;
 }
 
 // ------------------------------------------------------------ 构造请求
@@ -228,6 +277,9 @@ async function submit() {
   }
   requestPreview.textContent = JSON.stringify(payload, null, 2);
   const auditId = document.querySelector("#auditId").value.trim();
+  if (auditId && !document.querySelector("#srcAuditId").value.trim()) {
+    document.querySelector("#srcAuditId").value = auditId;  // 预填编组来源
+  }
   try {
     const headers = { "Content-Type": "application/json" };
     if (auditId) headers["X-Audit-Id"] = auditId;
@@ -273,10 +325,194 @@ function showResult(kind, r, envelope) {
   }
 }
 
+// ------------------------------------------------------------ 编组嵌入
+function buildEmbedPayload() {
+  const auditId = document.querySelector("#srcAuditId").value.trim() ||
+    document.querySelector("#auditId").value.trim();
+  if (!auditId) throw { loc: "audit_id", message: "请填写来源审计标识（optimal）" };
+  const groupId = document.querySelector("#groupId").value.trim();
+  if (!groupId) throw { loc: "group_id", message: "请填写编组标识" };
+  const batches = [];
+  const ids = new Set();
+  [...batchBody.rows].forEach((row, i) => {
+    const inputs = row.querySelectorAll("input");
+    const selects = row.querySelectorAll("select");
+    const bid = inputs[0].value.trim();
+    if (!bid) throw { loc: `batches[${i}].id`, message: "批次标识不能为空" };
+    if (ids.has(bid)) throw { loc: `batches[${i}].id`, message: `批次重复: ${bid}` };
+    ids.add(bid);
+    if (!selects[0].value) throw { loc: `batches[${i}].source`, message: "请选择来源站" };
+    if (!selects[1].value) throw { loc: `batches[${i}].target`, message: "请选择目标站" };
+    if (selects[0].value === selects[1].value)
+      throw { loc: `batches[${i}]`, message: "来源站与目标站不能相同" };
+    const volume = safeInt(inputs[1].value, `batches[${i}].volume`);
+    const forbid = inputs[2].value.split(",")
+      .map(s => s.trim()).filter(s => s);
+    batches.push({ id: bid, source: selects[0].value, target: selects[1].value,
+                   volume, forbid });
+  });
+  if (batches.length === 0)
+    throw { loc: "batches", message: "至少需要 1 批样品" };
+  return { audit_id: auditId, group_id: groupId, batches };
+}
+
+function usageTable(title, usage, extraHead) {
+  const rows = usage.map(u => el("tr", {},
+    el("td", { class: "mono", text: u.id }),
+    el("td", { text: `${u.from} → ${u.to}` }),
+    el("td", { class: "mono", text: u.flow }),
+    el("td", { class: "mono", text: u.used }),
+    el("td", { class: u.remaining === 0 ? "mono bad" : "mono ok",
+               text: u.remaining })));
+  return el("div", {},
+    el("h3", { text: title }),
+    el("div", { class: "table-wrap" },
+      el("table", { class: "result" },
+        el("thead", {}, el("tr", {},
+          el("th", { text: "管路" }), el("th", { text: "方向" }),
+          el("th", { text: "冻结流量" }), el("th", { text: "批次占用" }),
+          el("th", { text: extraHead || "剩余通量" }))),
+        el("tbody", {}, ...rows))));
+}
+
+function pathTable(title, batches) {
+  const rows = batches.map(b => el("tr", {},
+    el("td", { class: "mono", text: b.id }),
+    el("td", { text: `${b.source} → ${b.target}` }),
+    el("td", { class: "mono", text: b.volume }),
+    el("td", { class: "mono", text: b.path.join(" → ") }),
+    el("td", { class: "mono", text: b.stations.join(" → ") })));
+  return el("div", {},
+    el("h3", { text: title }),
+    el("div", { class: "table-wrap" },
+      el("table", { class: "result" },
+        el("thead", {}, el("tr", {},
+          el("th", { text: "批次" }), el("th", { text: "起讫" }),
+          el("th", { text: "体积" }), el("th", { text: "规范路径（管路）" }),
+          el("th", { text: "途经站点" }))),
+        el("tbody", {}, ...rows))));
+}
+
+function renderEmbedded(r, note) {
+  embedBody.appendChild(el("p", { class: "hint",
+    text: "每批不可拆分地安置在一条规范简单路径上；任意管路批次总量不超过其冻结流量。" }));
+  embedBody.appendChild(pathTable("按批次标识的规范路径", r.batches));
+  embedBody.appendChild(usageTable("逐管占用与剩余通量", r.pipe_usage));
+}
+
+function renderCannotEmbed(r, note) {
+  embedBody.appendChild(el("p", {},
+    el("b", { class: "bad", text: "无法同时装入。" }),
+    el("span", { text: `最先耗尽搜索层：第 ${r.first_exhausted_layer} 批（按提交顺序）。` })));
+  const urows = r.unplaced_batches.map(b => el("tr", {},
+    el("td", { class: "mono", text: b.id }),
+    el("td", { text: `${b.source} → ${b.target}` }),
+    el("td", { class: "mono bad", text: b.volume })));
+  embedBody.appendChild(el("h3", { text: "未安置批次（最先耗尽层及其后）" }));
+  embedBody.appendChild(el("div", { class: "table-wrap" },
+    el("table", { class: "result" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "批次" }), el("th", { text: "起讫" }),
+        el("th", { text: "体积" }))),
+      el("tbody", {}, ...urows))));
+  if (r.placed_prefix.length) {
+    embedBody.appendChild(pathTable("该层之前的规范前缀安置", r.placed_prefix));
+  }
+  if (r.saturated_pipes.length) {
+    embedBody.appendChild(usageTable("已占满管路（剩余通量 = 0）",
+                                     r.saturated_pipes));
+  } else {
+    embedBody.appendChild(el("p", { class: "hint",
+      text: "规范前缀安置下没有剩余通量归零的管路（瓶颈为容量不足而非占满）。" }));
+  }
+  embedBody.appendChild(usageTable("逐管剩余容量（冻结管路顺序）",
+                                   r.remaining_capacity, "剩余容量"));
+}
+
+function showEmbedResult(kind, r, note) {
+  embedResultCard.classList.remove("hidden");
+  embedBody.innerHTML = "";
+  embedBanner.innerHTML = "";
+  if (kind === "embedded") {
+    embedBanner.appendChild(el("div", { class: "banner optimal",
+      text: `✓ 全部批次已同时嵌入冻结流量${note || ""}` }));
+    renderEmbedded(r, note);
+  } else if (kind === "cannot_embed") {
+    embedBanner.appendChild(el("div", { class: "banner infeasible",
+      text: `✗ 批次无法同时装入当次冻结流量${note || ""}` }));
+    renderCannotEmbed(r, note);
+  } else {
+    embedBanner.appendChild(el("div", { class: "banner invalid",
+      text: "⚠ 编组请求被拒绝" }));
+    embedBody.appendChild(el("p", {},
+      el("b", { class: "bad", text: "" }),
+      el("span", { class: "mono", text: `${r.loc ? r.loc + " — " : ""}${r.error}` })));
+  }
+}
+
+async function submitEmbed() {
+  let payload;
+  try {
+    payload = buildEmbedPayload();
+  } catch (e) {
+    showEmbedResult("invalid", { error: e.message, loc: e.loc });
+    return;
+  }
+  try {
+    const resp = await fetch("/api/embed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (resp.status === 409) {
+      showEmbedResult("invalid", {
+        error: `${data.error}（已存指纹 ${
+          (data.conflict?.request_fingerprint || "").slice(0, 12)}…）`,
+        loc: "group_id",
+      });
+      return;
+    }
+    if (resp.status !== 200) {
+      showEmbedResult("invalid", { error: data.error, loc: data.loc });
+      return;
+    }
+    const note = data.replayed ? "（同标识重传，回放原编组结论）" : "";
+    showEmbedResult(data.status, data.result, note);
+  } catch (e) {
+    showEmbedResult("invalid", { error: `请求失败: ${e}`, loc: "$" });
+  }
+}
+
+async function lookupGroup() {
+  const gid = document.querySelector("#lookupGroupId").value.trim();
+  if (!gid) {
+    showEmbedResult("invalid", { error: "请填写要查询的编组标识", loc: "group_id" });
+    return;
+  }
+  try {
+    const resp = await fetch(`/api/groups/${encodeURIComponent(gid)}`);
+    const data = await resp.json();
+    if (resp.status !== 200) {
+      showEmbedResult("invalid", { error: data.error, loc: "group_id" });
+      return;
+    }
+    document.querySelector("#groupId").value = data.group_id;
+    document.querySelector("#srcAuditId").value = data.audit_id;
+    showEmbedResult(data.status, data.result,
+      `（历史编组记录 · 来源审计 ${data.audit_id}）`);
+  } catch (e) {
+    showEmbedResult("invalid", { error: `查询失败: ${e}`, loc: "$" });
+  }
+}
+
 // ------------------------------------------------------------ 初始化
 document.querySelector("#addStation").onclick = () => addStationRow();
 document.querySelector("#addPipe").onclick = () => addPipeRow();
 document.querySelector("#submitBtn").onclick = submit;
+document.querySelector("#addBatch").onclick = () => addBatchRow();
+document.querySelector("#embedBtn").onclick = submitEmbed;
+document.querySelector("#lookupGroupBtn").onclick = lookupGroup;
 document.querySelector("#clearAll").onclick = () => {
   stationBody.innerHTML = "";
   pipeBody.innerHTML = "";
@@ -307,4 +543,5 @@ document.querySelector("#loadSample").onclick = () => {
 };
 for (const s of SAMPLE.stations) addStationRow(s.id, String(s.balance));
 for (const p of SAMPLE.pipes) addPipeRow(p);
+addBatchRow({ id: "b1", source: "S1", target: "D1", volume: 2 });
 renderCounter();

@@ -43,7 +43,7 @@ input, select {
   padding: 6px 8px;
   font-size: 14px;
 }
-#auditId { width: 320px; max-width: 100%; }
+#auditId, #srcAuditId, #groupId, #lookupGroupId { width: 300px; max-width: 100%; }
 button {
   background: #243049;
   border: 1px solid var(--border);

@@ -65,9 +65,45 @@
     <div id="statusBanner"></div>
     <div id="resultBody"></div>
   </section>
+
+  <section class="card">
+    <h2>6. 实物批次编组嵌入（基于已冻结的最优审计）</h2>
+    <p class="hint">来源审计须为 <b>optimal</b>：服务冻结其站点、稳定管路顺序与每条已求得流量，
+      对至多 <b>6</b> 批不可拆分标准样品做完整整数容量分配（每批：来源站、目标站、整数体积、禁行管路）。
+      <b>同编组标识重传</b>回放原结论；<b>改换来源或批次</b>将被拒绝(409)。刷新或重开页面后可按编组标识核对同一结论。</p>
+    <div class="row">
+      <input id="srcAuditId" type="text" maxlength="64" placeholder="来源审计标识（须为 optimal）">
+      <input id="groupId" type="text" maxlength="64" placeholder="编组标识（字母/数字/._-）">
+    </div>
+    <div class="table-wrap">
+      <table id="batchTable">
+        <thead><tr>
+          <th>批次标识</th><th>来源站</th><th>目标站</th>
+          <th>整数体积</th><th>禁行管路（逗号分隔）</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row">
+      <button type="button" id="addBatch">＋ 增加批次</button>
+      <button type="button" id="embedBtn" class="primary">提交编组嵌入</button>
+      <span id="batchCounter" class="hint"></span>
+    </div>
+    <div class="row">
+      <input id="lookupGroupId" type="text" maxlength="64" placeholder="按编组标识查询历史结论">
+      <button type="button" id="lookupGroupBtn">查询编组记录</button>
+    </div>
+  </section>
+
+  <section id="embedResultCard" class="card hidden">
+    <h2>7. 编组结论</h2>
+    <div id="embedBanner"></div>
+    <div id="embedBody"></div>
+  </section>
 </main>
 
-<footer>后端：下界消去 → Dinic 可行流 → Bellman-Ford 负环消除（精确整数，不限轮次）</footer>
+<footer>后端：下界消去 → Dinic 可行流 → Bellman-Ford 负环消除（精确整数，不限轮次）；
+  编组嵌入：简单路径枚举 + 带回溯的完整整数容量分配（非最短路/贪心）</footer>
 <script src="/static/app.js"></script>
 </body>
 </html>

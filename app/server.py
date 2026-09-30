@@ -6,6 +6,9 @@
   GET  /health               健康检查
   POST /api/solve            提交网络求解（支持 X-Audit-Id 幂等）
   GET  /api/records/<id>     查看审计原记录
+  POST /api/embed            实物批次编组嵌入（基于已冻结的 optimal 审计，
+                             支持 X-Group-Id / group_id 幂等回放）
+  GET  /api/groups/<id>      查看编组原记录
 """
 
 from __future__ import annotations
@@ -17,12 +20,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from audit import AuditError, AuditStore
+from embed import (EmbedError, GroupConflict, GroupStore, embed,
+                   freeze_from_audit_record, validate_batches)
 from solver import ValidationError, solve_payload
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUDIT_DB = os.environ.get("AUDIT_DB", "/data/audit.json")
+GROUP_DB = os.environ.get("GROUP_DB", "/data/groups.json")
 
 _store = AuditStore(AUDIT_DB)
+_groups = GroupStore(GROUP_DB)
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
@@ -95,16 +102,28 @@ class Handler(BaseHTTPRequestHandler):
                                 404)
             else:
                 self._send_json(rec)
+        elif path.startswith("/api/groups/"):
+            group_id = unquote(path[len("/api/groups/"):])
+            rec = _groups.get(group_id)
+            if rec is None:
+                self._send_json({"error": "编组标识不存在", "group_id": group_id},
+                                404)
+            else:
+                self._send_json(rec)
         else:
             self._send_json({"error": "not found", "path": path}, 404)
 
     # ------------------------------------------------------------ POST
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path != "/api/solve":
+        if path == "/api/solve":
+            self._handle_solve()
+        elif path == "/api/embed":
+            self._handle_embed()
+        else:
             self._send_json({"error": "not found", "path": path}, 404)
-            return
 
+    def _handle_solve(self):
         payload = self._read_json()
         if payload is _MISSING:
             return
@@ -162,6 +181,84 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(body, http_status)
 
+    def _handle_embed(self):
+        """实物批次编组嵌入：只接受 optimal 审计来源，冻结其站点、稳定
+        管路顺序与每条已求得流量，对至多 6 批不可拆分样品做完整整数容量
+        分配；同编组标识重传回放原结论，改换来源或批次拒绝(409)。"""
+        payload = self._read_json()
+        if payload is _MISSING:
+            return
+        if not isinstance(payload, dict):
+            self._send_json(
+                {"error": "请求体必须是 JSON 对象 {audit_id, group_id, batches}"},
+                400)
+            return
+
+        audit_id = payload.get("audit_id")
+        if (not isinstance(audit_id, str) or not _SAFE_NAME.match(audit_id)
+                or len(audit_id) > 64):
+            self._send_json(
+                {"error": "来源审计标识 audit_id 须为 <=64 字符的字母/数字/._- 组合",
+                 "loc": "audit_id"}, 400)
+            return
+
+        group_id = self.headers.get("X-Group-Id") or payload.get("group_id")
+        if (not isinstance(group_id, str) or not _SAFE_NAME.match(group_id)
+                or len(group_id) > 64):
+            self._send_json(
+                {"error": "编组标识 group_id 须为 <=64 字符的字母/数字/._- 组合",
+                 "loc": "group_id"}, 400)
+            return
+
+        # 幂等键 = 来源审计 + 批次（编组标识本身不参与指纹）
+        request = {"audit_id": audit_id, "batches": payload.get("batches")}
+        try:
+            hit = _groups.lookup(group_id, request)
+        except GroupConflict as exc:
+            self._send_json(
+                {"error": exc.message, "conflict": exc.existing}, 409)
+            return
+        if hit is not None:
+            self._send_json({
+                "group_id": group_id,
+                "audit_id": audit_id,
+                "replayed": True,
+                "status": hit["status"],
+                "request_fingerprint": hit["request_fingerprint"],
+                "result": hit["result"],
+            }, 200, [("X-Idempotent-Replay", "true")])
+            return
+
+        record = _store.get(audit_id)
+        if record is None:
+            self._send_json(
+                {"error": f"来源审计 {audit_id!r} 不存在", "audit_id": audit_id},
+                404)
+            return
+
+        try:
+            frozen = freeze_from_audit_record(record)
+            batches = validate_batches(payload.get("batches"), frozen)
+        except EmbedError as exc:
+            self._send_json(
+                {"error": exc.message, "loc": exc.loc, "status": "invalid"}, 400)
+            return
+        except Exception as exc:  # 防御性：不吞掉状态
+            self._send_json({"error": f"服务器内部错误: {exc!r}"}, 500)
+            return
+
+        result = embed(frozen, batches)
+        rec = _groups.save(group_id, request, frozen, batches,
+                           result["status"], result)
+        self._send_json({
+            "group_id": group_id,
+            "audit_id": audit_id,
+            "replayed": False,
+            "status": rec["status"],
+            "request_fingerprint": rec["request_fingerprint"],
+            "result": result,
+        }, 200)
+
 
 _MISSING = object()
 
@@ -170,8 +267,8 @@ def main():
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     httpd = ThreadingHTTPServer((host, port), Handler)
-    print(f"calibration-flow listening on {host}:{port}, audit db {AUDIT_DB}",
-          flush=True)
+    print(f"calibration-flow listening on {host}:{port}, audit db {AUDIT_DB}, "
+          f"group db {GROUP_DB}", flush=True)
     httpd.serve_forever()
 
 

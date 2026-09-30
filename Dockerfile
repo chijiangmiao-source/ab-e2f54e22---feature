@@ -6,7 +6,8 @@ FROM python:3.11-slim AS app
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8080 \
-    AUDIT_DB=/data/audit.json
+    AUDIT_DB=/data/audit.json \
+    GROUP_DB=/data/groups.json
 
 WORKDIR /app
 COPY app/ /app/
